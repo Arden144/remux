@@ -387,12 +387,6 @@ impl TaskService {
             cron
         };
 
-        let tasks = self
-            .tasks
-            .clone();
-        let ctx = self
-            .ctx
-            .clone();
         let task_service = self.clone();
         let task_id = trigger
             .task_id
@@ -400,19 +394,13 @@ impl TaskService {
         let task_id_for_closure = task_id.clone();
 
         let job = Job::new_async(cron.as_str(), move |_uuid, _l| {
-            let tasks = tasks.clone();
-            let ctx = ctx.clone();
-            let task_service = Arc::new(task_service.clone());
+            let task_service = task_service.clone();
             let task_id = task_id_for_closure.clone();
 
             Box::pin(async move {
-                if let Some(handler) = tasks
-                    .lock()
-                    .await
-                    .get_mut(&task_id)
-                {
-                    handler.run(ctx, task_service);
-                }
+                let _ = task_service
+                    .run_task(&task_id)
+                    .await;
             })
         })?;
 
@@ -485,12 +473,19 @@ impl TaskService {
     }
 
     pub async fn run_task(&self, task_key: &str) -> Result<()> {
-        if let Some(handler) = self
+        let mut tasks = self
             .tasks
             .lock()
-            .await
-            .get_mut(&task_key.to_lowercase())
+            .await;
+        if self
+            .ctx
+            .shutdown_requested
+            .is_cancelled()
         {
+            return Err(anyhow!("scheduled tasks are shutting down"));
+        }
+
+        if let Some(handler) = tasks.get_mut(&task_key.to_lowercase()) {
             handler.run(
                 self.ctx
                     .clone(),
@@ -550,6 +545,65 @@ impl TaskService {
         self.scheduler
             .start()
             .await?;
+
+        let mut scheduler = self
+            .scheduler
+            .clone();
+        let tasks = self
+            .tasks
+            .clone();
+        let shutdown_requested = self
+            .ctx
+            .shutdown_requested
+            .clone();
+        let handle = tokio::spawn(async move {
+            shutdown_requested
+                .cancelled_owned()
+                .await;
+            let handles = {
+                let mut tasks = tasks
+                    .lock()
+                    .await;
+                let mut handles = Vec::new();
+                for handler in tasks.values_mut() {
+                    if let Some(handle) = handler
+                        .handle
+                        .take()
+                    {
+                        if !handle.is_finished() {
+                            handle.abort();
+                            let mut status = handler.lock_status();
+                            if *status == TaskStatus::Running {
+                                *status = TaskStatus::Stopped;
+                            }
+                        }
+                        handles.push(handle);
+                    }
+                }
+                handles
+            };
+
+            if let Err(error) = scheduler
+                .shutdown()
+                .await
+            {
+                error!(%error, "failed to stop task scheduler");
+            }
+
+            for handle in handles {
+                let _ = handle.await;
+            }
+        });
+        *self
+            .ctx
+            .task_shutdown_abort
+            .lock()
+            .await = Some(handle.abort_handle());
+        *self
+            .ctx
+            .task_shutdown
+            .lock()
+            .await = Some(handle);
         Ok(())
     }
 
@@ -575,6 +629,86 @@ pub(super) fn iter_dir(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_aborts_active_tasks_and_preserves_finished_status() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        guard
+            .0
+            .task_shutdown
+            .lock()
+            .await
+            .take()
+            .unwrap()
+            .abort();
+        let service = TaskService::new(
+            guard
+                .0
+                .clone(),
+        )
+        .await
+        .unwrap();
+        let blocked = tokio::spawn(std::future::pending::<()>());
+        let abort = blocked.abort_handle();
+        {
+            let mut tasks = service
+                .tasks
+                .lock()
+                .await;
+            let handler = tasks
+                .get_mut("refreshlibrary")
+                .unwrap();
+            handler.handle = Some(blocked);
+            *handler.lock_status() = TaskStatus::Running;
+            let handler = tasks
+                .get_mut("refreshcatalogs")
+                .unwrap();
+            let finished = tokio::spawn(async {});
+            while !finished.is_finished() {
+                tokio::task::yield_now().await;
+            }
+            handler.handle = Some(finished);
+            *handler.lock_status() = TaskStatus::Failed("test failure".into());
+        }
+        service
+            .start()
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            guard
+                .0
+                .shutdown(),
+        )
+        .await
+        .unwrap();
+        assert!(abort.is_finished());
+        let tasks = service
+            .tasks
+            .lock()
+            .await;
+        assert!(
+            tasks
+                .values()
+                .all(|handler| handler
+                    .handle
+                    .is_none())
+        );
+        assert_eq!(*tasks["refreshlibrary"].lock_status(), TaskStatus::Stopped);
+        assert_eq!(
+            *tasks["refreshcatalogs"].lock_status(),
+            TaskStatus::Failed("test failure".into())
+        );
+        drop(tasks);
+        assert!(
+            service
+                .run_task("refreshlibrary")
+                .await
+                .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn registry_lists_phase_tasks_without_default_triggers() {

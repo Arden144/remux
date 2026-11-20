@@ -30,6 +30,8 @@ struct SidecarSubtitleFile {
 pub struct TorrentManager {
     session: Arc<Session>,
     http_port: u16,
+    http_server: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    cancellation: tokio_util::sync::CancellationToken,
     leases: tokio::sync::Mutex<
         std::collections::HashMap<String, std::sync::Weak<TorrentLease>>,
     >,
@@ -65,6 +67,19 @@ impl Drop for TorrentLease {
     }
 }
 
+impl Drop for TorrentManager {
+    fn drop(&mut self) {
+        if let Some(handle) = self
+            .http_server
+            .get_mut()
+        {
+            handle.abort();
+        }
+        self.cancellation
+            .cancel();
+    }
+}
+
 impl TorrentManager {
     pub async fn new(
         data_dir: PathBuf,
@@ -73,8 +88,18 @@ impl TorrentManager {
         disable_dht: bool,
         peer_port: Option<u16>,
     ) -> Result<Self> {
-        let session =
-            Self::start_session(data_dir, cache_dir, disable_dht, peer_port).await?;
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let startup_guard = cancellation
+            .clone()
+            .drop_guard();
+        let session = Self::start_session(
+            data_dir,
+            cache_dir,
+            disable_dht,
+            peer_port,
+            &cancellation,
+        )
+        .await?;
 
         // None → let the OS pick a free ephemeral port.
         let bind_port = http_port.unwrap_or(0);
@@ -92,12 +117,19 @@ impl TorrentManager {
 
         let api = Api::new(session.clone(), None, None);
         let http_api = HttpApi::new(api, None);
-        tokio::spawn(http_api.make_http_api_and_run(listener, None));
+        let http_server = tokio::spawn(async move {
+            if let Err(error) = serve_torrent_http(listener, http_api).await {
+                warn!(%error, "torrent HTTP server stopped");
+            }
+        });
 
         debug!(port = bound_port, "torrent HTTP server listening");
+        startup_guard.disarm();
         Ok(Self {
             session,
             http_port: bound_port,
+            http_server: tokio::sync::Mutex::new(Some(http_server)),
+            cancellation,
             leases: Default::default(),
         })
     }
@@ -110,12 +142,14 @@ impl TorrentManager {
         cache_dir: PathBuf,
         disable_dht: bool,
         peer_port: Option<u16>,
+        cancellation: &tokio_util::sync::CancellationToken,
     ) -> Result<Arc<Session>> {
         const PEER_PORT_SPAN: u16 = 10;
         let attempts = peer_port.map_or(1, |_| PEER_PORT_SPAN);
         let mut last_error = None;
         for offset in 0..attempts {
             let options = SessionOptions {
+                cancellation_token: Some(cancellation.child_token()),
                 dht: (!disable_dht).then(|| DhtSessionConfig {
                     persistence: Some(DhtPersistenceConfig {
                         config_filename: Some(cache_dir.join("dht.json")),
@@ -261,6 +295,19 @@ impl TorrentManager {
     /// (including the DHT UDP socket). Call this before dropping the manager
     /// to avoid "address already in use" errors on restart.
     pub async fn shutdown(&self) {
+        self.cancellation
+            .cancel();
+        {
+            let mut http_server = self
+                .http_server
+                .lock()
+                .await;
+            if let Some(handle) = http_server.as_mut() {
+                handle.abort();
+                let _ = handle.await;
+            }
+            http_server.take();
+        }
         self.session
             .stop()
             .await;
@@ -501,6 +548,41 @@ impl crate::stream::StreamInfo {
                 ai_translated: None,
             })
             .collect()
+    }
+}
+
+async fn serve_torrent_http(listener: TcpListener, api: HttpApi) -> Result<()> {
+    let backend = TcpListener::bind_tcp(
+        ([127, 0, 0, 1], 0).into(),
+        BindOpts {
+            request_dualstack: false,
+            ..Default::default()
+        },
+    )?;
+    let backend_addr = backend.bind_addr();
+    let server = api.make_http_api_and_run(backend, None);
+    tokio::pin!(server);
+    let mut connections = tokio::task::JoinSet::new();
+
+    loop {
+        tokio::select! {
+            result = &mut server => return result,
+            accepted = listener.accept() => {
+                let (mut client, _) = accepted?;
+                connections.spawn(async move {
+                    let mut upstream = tokio::net::TcpStream::connect(backend_addr).await?;
+                    tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+                    std::io::Result::Ok(())
+                });
+            }
+            result = connections.join_next(), if !connections.is_empty() => {
+                match result {
+                    Some(Ok(Err(error))) => debug!(%error, "torrent HTTP proxy connection ended"),
+                    Some(Err(error)) => warn!(%error, "torrent HTTP proxy task failed"),
+                    _ => {}
+                }
+            }
+        }
     }
 }
 
@@ -787,6 +869,96 @@ fn parse_file_idx_param(magnet: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn http_keepalive_closes_on_shutdown_and_drop() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for shutdown in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let manager = TorrentManager::new(
+                dir.path()
+                    .join("data"),
+                dir.path()
+                    .join("cache"),
+                None,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+            let http_abort = manager
+                .http_server
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .abort_handle();
+            let addr = (std::net::Ipv4Addr::LOCALHOST, manager.http_port);
+            let mut client = tokio::net::TcpStream::connect(addr)
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                client
+                    .write_all(b"HEAD / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .await
+                    .unwrap();
+                let headers = tokio::time::timeout(Duration::from_secs(5), async {
+                    let mut headers = Vec::new();
+                    while !headers.ends_with(b"\r\n\r\n") {
+                        assert!(headers.len() < 8192);
+                        headers.push(
+                            client
+                                .read_u8()
+                                .await
+                                .unwrap(),
+                        );
+                    }
+                    headers
+                })
+                .await
+                .unwrap();
+                assert!(headers.starts_with(b"HTTP/1.1 200"));
+            }
+            if shutdown {
+                manager
+                    .shutdown()
+                    .await;
+                assert!(http_abort.is_finished());
+                assert!(
+                    manager
+                        .http_server
+                        .lock()
+                        .await
+                        .is_none()
+                );
+                manager
+                    .shutdown()
+                    .await;
+            } else {
+                drop(manager);
+            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let mut byte = [0];
+                match client
+                    .read(&mut byte)
+                    .await
+                {
+                    Ok(0) => {}
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    result => panic!("HTTP socket remained open: {result:?}"),
+                }
+                assert!(
+                    tokio::net::TcpStream::connect(addr)
+                        .await
+                        .is_err()
+                );
+            })
+            .await
+            .expect("HTTP shutdown must close keepalive sockets and listener");
+        }
+    }
 
     #[tokio::test]
     async fn cleanup_waits_for_sessions_and_readers_and_respects_reacquisition() {

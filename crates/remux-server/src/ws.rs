@@ -106,7 +106,16 @@ pub async fn ws_handler(
     State(state): State<AppState>,
     session: AuthSession,
 ) -> impl IntoResponse {
-    ws.on_upgrade(|socket| handle_socket(socket, state, session))
+    ws.on_upgrade(|socket| async move {
+        let shutdown = state
+            .ctx
+            .shutdown_requested
+            .clone();
+        tokio::select! {
+            _ = shutdown.cancelled() => {}
+            _ = handle_socket(socket, state, session) => {}
+        }
+    })
 }
 
 async fn handle_socket(mut socket: WebSocket, state: AppState, session: AuthSession) {

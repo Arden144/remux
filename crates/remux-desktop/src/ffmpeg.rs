@@ -235,21 +235,59 @@ async fn download(bin_dir: &Path) -> Result<()> {
         .bytes()
         .await?;
 
-    if name.ends_with(".tar.xz") {
-        extract_tar_xz(&bytes, bin_dir)?;
-    } else if name.ends_with(".tar.gz") {
-        extract_tar_gz(&bytes, bin_dir)?;
-    } else if name.ends_with(".zip") {
-        extract_zip(&bytes, bin_dir)?;
-    } else {
-        bail!("unknown archive format: {name}");
-    }
-
-    #[cfg(unix)]
-    set_executable(bin_dir)?;
+    let name = name.to_owned();
+    let dest = bin_dir.to_owned();
+    tokio::task::spawn_blocking(move || install_archive(&name, &bytes, &dest))
+        .await??;
 
     tracing::info!(dir = %bin_dir.display(), "jellyfin-ffmpeg installed");
     Ok(())
+}
+
+fn create_staging_dir(bin_dir: &Path) -> Result<PathBuf> {
+    for index in 0.. {
+        let path =
+            bin_dir.join(format!(".ffmpeg-staging-{}-{index}", std::process::id()));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    unreachable!()
+}
+
+fn install_archive(name: &str, data: &[u8], bin_dir: &Path) -> Result<()> {
+    let staging = create_staging_dir(bin_dir)?;
+    let result = (|| -> Result<()> {
+        if name.ends_with(".tar.xz") {
+            extract_tar_xz(data, &staging)?;
+        } else if name.ends_with(".tar.gz") {
+            extract_tar_gz(data, &staging)?;
+        } else if name.ends_with(".zip") {
+            extract_zip(data, &staging)?;
+        } else {
+            bail!("unknown archive format: {name}");
+        }
+
+        for name in [FFMPEG_BIN, FFPROBE_BIN] {
+            if !staging
+                .join(name)
+                .is_file()
+            {
+                bail!("archive is missing {name}");
+            }
+        }
+        #[cfg(unix)]
+        set_executable(&staging)?;
+
+        for name in [FFMPEG_BIN, FFPROBE_BIN] {
+            std::fs::rename(staging.join(name), bin_dir.join(name))?;
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_dir_all(&staging);
+    result
 }
 
 fn extract_tar_xz(data: &[u8], dest: &Path) -> Result<()> {
@@ -261,7 +299,17 @@ fn extract_tar_xz(data: &[u8], dest: &Path) -> Result<()> {
         let mut entry = entry?;
         let path = entry.path()?;
         if let Some(name) = path.file_name() {
-            if name == "ffmpeg" || name == "ffprobe" {
+            if name == FFMPEG_BIN || name == FFPROBE_BIN {
+                if !entry
+                    .header()
+                    .entry_type()
+                    .is_file()
+                {
+                    bail!(
+                        "archive binary is not a regular file: {}",
+                        name.to_string_lossy()
+                    );
+                }
                 entry.unpack(dest.join(name))?;
             }
         }
@@ -278,7 +326,17 @@ fn extract_tar_gz(data: &[u8], dest: &Path) -> Result<()> {
         let mut entry = entry?;
         let path = entry.path()?;
         if let Some(name) = path.file_name() {
-            if name == "ffmpeg" || name == "ffprobe" {
+            if name == FFMPEG_BIN || name == FFPROBE_BIN {
+                if !entry
+                    .header()
+                    .entry_type()
+                    .is_file()
+                {
+                    bail!(
+                        "archive binary is not a regular file: {}",
+                        name.to_string_lossy()
+                    );
+                }
                 entry.unpack(dest.join(name))?;
             }
         }
@@ -302,7 +360,7 @@ fn extract_zip(data: &[u8], dest: &Path) -> Result<()> {
                     .into_owned()
             })
             .unwrap_or_default();
-        if file_name == "ffmpeg.exe" || file_name == "ffprobe.exe" {
+        if file_name == FFMPEG_BIN || file_name == FFPROBE_BIN {
             let out = dest.join(&file_name);
             let mut out_file = std::fs::File::create(&out)?;
             std::io::copy(&mut file, &mut out_file)?;
@@ -329,6 +387,98 @@ fn set_executable(bin_dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::{Cursor, Write};
+
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (name, contents) in entries {
+            zip.start_file(*name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(contents)
+                .unwrap();
+        }
+        zip.finish()
+            .unwrap()
+            .into_inner()
+    }
+
+    #[test]
+    fn installs_complete_binaries_from_staging() {
+        let bin_dir = create_staging_dir(&std::env::temp_dir()).unwrap();
+        std::fs::write(bin_dir.join(FFMPEG_BIN), b"old ffmpeg").unwrap();
+        std::fs::write(bin_dir.join(FFPROBE_BIN), b"old ffprobe").unwrap();
+        let data =
+            archive(&[(FFMPEG_BIN, b"new ffmpeg"), (FFPROBE_BIN, b"new ffprobe")]);
+
+        install_archive("ffmpeg.zip", &data, &bin_dir).unwrap();
+
+        assert_eq!(
+            std::fs::read(bin_dir.join(FFMPEG_BIN)).unwrap(),
+            b"new ffmpeg"
+        );
+        assert_eq!(
+            std::fs::read(bin_dir.join(FFPROBE_BIN)).unwrap(),
+            b"new ffprobe"
+        );
+        assert_eq!(
+            std::fs::read_dir(&bin_dir)
+                .unwrap()
+                .count(),
+            2
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for name in [FFMPEG_BIN, FFPROBE_BIN] {
+                let permissions = std::fs::metadata(bin_dir.join(name))
+                    .unwrap()
+                    .permissions();
+                assert_eq!(permissions.mode() & 0o777, 0o755);
+            }
+        }
+        std::fs::remove_dir_all(bin_dir).unwrap();
+    }
+
+    #[test]
+    fn incomplete_archive_preserves_installed_binaries() {
+        let bin_dir = create_staging_dir(&std::env::temp_dir()).unwrap();
+        std::fs::write(bin_dir.join(FFMPEG_BIN), b"old ffmpeg").unwrap();
+        std::fs::write(bin_dir.join(FFPROBE_BIN), b"old ffprobe").unwrap();
+        let data = archive(&[(FFMPEG_BIN, b"new ffmpeg")]);
+
+        assert!(install_archive("ffmpeg.zip", &data, &bin_dir).is_err());
+
+        assert_eq!(
+            std::fs::read(bin_dir.join(FFMPEG_BIN)).unwrap(),
+            b"old ffmpeg"
+        );
+        assert_eq!(
+            std::fs::read(bin_dir.join(FFPROBE_BIN)).unwrap(),
+            b"old ffprobe"
+        );
+        assert_eq!(
+            std::fs::read_dir(&bin_dir)
+                .unwrap()
+                .count(),
+            2
+        );
+        std::fs::remove_dir_all(bin_dir).unwrap();
+    }
+
+    #[test]
+    fn invalid_archive_leaves_no_installed_binaries() {
+        let bin_dir = create_staging_dir(&std::env::temp_dir()).unwrap();
+
+        assert!(install_archive("ffmpeg.zip", b"invalid", &bin_dir).is_err());
+        assert_eq!(
+            std::fs::read_dir(&bin_dir)
+                .unwrap()
+                .count(),
+            0
+        );
+        std::fs::remove_dir_all(bin_dir).unwrap();
+    }
 
     #[test]
     fn parses_the_major_version_from_ffmpeg_output() {

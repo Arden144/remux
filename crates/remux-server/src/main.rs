@@ -97,9 +97,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    serve(config).await?;
-    // Don't wait for in-flight blocking tasks.
-    std::process::exit(0)
+    serve(config).await
 }
 
 #[cfg(test)]

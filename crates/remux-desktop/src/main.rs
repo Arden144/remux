@@ -3,11 +3,11 @@
 mod ffmpeg;
 
 use anyhow::Result;
-use std::{
-    path::PathBuf,
-    sync::{Arc, OnceLock},
+use std::path::PathBuf;
+use tao::{
+    event::Event,
+    event_loop::{ControlFlow, EventLoop},
 };
-use tao::event_loop::{ControlFlow, EventLoop};
 use tray_icon::{
     TrayIconBuilder,
     menu::{Menu, MenuEvent, MenuItem},
@@ -80,44 +80,15 @@ fn main() -> Result<()> {
     }
     ensure_data_dirs(&config)?;
 
-    // Start the remux server in a background tokio thread with embedded assets.
     let rt = tokio::runtime::Runtime::new()?;
-    let rt_handle = rt
-        .handle()
-        .clone();
-    // Filled once the server is up, so Quit can shut it down.
-    let app: Arc<OnceLock<remux_server::AppContext>> = Arc::new(OnceLock::new());
-    let server_app = app.clone();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let server_shutdown = shutdown.clone();
     let server_config = config.clone();
     let cleanup_dir = log_dir.clone();
     let cleanup_retention = config.log_file_retention_days;
     let data_dir_for_ffmpeg = config
         .data_dir
         .clone();
-    std::thread::spawn(move || {
-        rt.block_on(async move {
-            if let Some(log_dir) = cleanup_dir {
-                remux_server::logging::start_periodic_cleanup(
-                    log_dir,
-                    cleanup_retention,
-                );
-            }
-            if let Err(e) = ffmpeg::ensure_ffmpeg(&data_dir_for_ffmpeg).await {
-                tracing::warn!(
-                    "ffmpeg could not be downloaded and was not found on this system: {e:#}. \
-                     Transcoding will not work. Install ffmpeg manually \
-                     (e.g. via Homebrew: brew install ffmpeg) or set the FFMPEG_PATH \
-                     environment variable."
-                );
-            }
-            if let Err(e) = serve(server_config, &server_app).await {
-                tracing::error!("server error: {e:#}");
-            }
-        });
-    });
-
-    // Build event loop. On macOS set Accessory policy so the app has no Dock icon
-    // and doesn't appear in the Cmd+Tab switcher.
     let event_loop = {
         #[cfg(target_os = "macos")]
         {
@@ -129,6 +100,36 @@ fn main() -> Result<()> {
         #[cfg(not(target_os = "macos"))]
         EventLoop::new()
     };
+    let proxy = event_loop.create_proxy();
+
+    std::thread::spawn(move || {
+        rt.block_on(async move {
+            if let Some(log_dir) = cleanup_dir {
+                remux_server::logging::start_periodic_cleanup(
+                    log_dir,
+                    cleanup_retention,
+                );
+            }
+            let ffmpeg_result = tokio::select! {
+                biased;
+                _ = server_shutdown.cancelled() => return,
+                result = ffmpeg::ensure_ffmpeg(&data_dir_for_ffmpeg) => result,
+            };
+            if let Err(e) = ffmpeg_result {
+                tracing::warn!(
+                    "ffmpeg could not be downloaded and was not found on this system: {e:#}. \
+                     Transcoding will not work. Install ffmpeg manually \
+                     (e.g. via Homebrew: brew install ffmpeg) or set the FFMPEG_PATH \
+                     environment variable."
+                );
+            }
+            if let Err(e) = serve(server_config, server_shutdown).await {
+                tracing::error!("server error: {e:#}");
+            }
+        });
+        rt.shutdown_timeout(std::time::Duration::from_secs(5));
+        let _ = proxy.send_event(());
+    });
 
     let open_item = MenuItem::new("Open", true, None);
     let logs_item = MenuItem::new("Logs", log_dir.is_some(), None);
@@ -160,8 +161,12 @@ fn main() -> Result<()> {
     let menu_channel = MenuEvent::receiver();
     let url = server_url(&config);
 
-    event_loop.run(move |_event, _, control_flow| {
+    event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
+        if matches!(event, Event::UserEvent(())) {
+            *control_flow = ControlFlow::Exit;
+            return;
+        }
 
         if let Ok(ev) = menu_channel.try_recv() {
             if ev.id == open_id {
@@ -173,19 +178,15 @@ fn main() -> Result<()> {
                 }
             } else if ev.id == quit_id {
                 tracing::info!("quit");
-                // Exiting runs no destructors: ffmpeg would outlive the app.
-                if let Some(ctx) = app.get() {
-                    rt_handle.block_on(ctx.shutdown());
-                }
-                *control_flow = ControlFlow::Exit;
+                shutdown.cancel();
             }
         }
-    });
+    })
 }
 
 async fn serve(
     config: remux_server::Config,
-    app: &OnceLock<remux_server::AppContext>,
+    shutdown: tokio_util::sync::CancellationToken,
 ) -> anyhow::Result<()> {
     #[cfg(dashboard_built)]
     let admin = remux_server::embedded_static::EmbeddedDir {
@@ -212,8 +213,12 @@ async fn serve(
     #[cfg(not(remux_web_built))]
     let remux_web = None;
 
-    let (router, ctx) =
-        remux_server::init_app(config, None, admin, remux_web, |pool| {
+    let Some((router, ctx)) = remux_server::init_app_with_shutdown(
+        config,
+        None,
+        admin,
+        remux_web,
+        |pool| {
             #[cfg(jellyfin_web_built)]
             {
                 remux_server::WebClientService::from_embedded(&JELLYFIN_WEB, pool)
@@ -223,10 +228,15 @@ async fn serve(
             {
                 remux_server::WebClientService::from_filesystem(&web_path, pool)
             }
-        })
-        .await?;
-    let _ = app.set(ctx);
-    remux_server::bind_and_serve(router, addr).await
+        },
+        shutdown.clone(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+    remux_server::serve_until_shutdown(router, addr, ctx, shutdown.cancelled_owned())
+        .await
 }
 
 fn load_icon() -> tray_icon::Icon {

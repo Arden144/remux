@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     AppState, OptionExt, ResultExt, api,
-    common::{self, get_uuid, server_id},
+    common::{get_uuid, server_id},
     db::{self, auth},
     intro,
 };
@@ -794,7 +794,7 @@ pub async fn get_utc_time() -> impl IntoResponse {
 pub async fn system_restart(
     State(state): State<AppState>,
     session: auth::AdminSession,
-) -> Result<impl IntoResponse> {
+) -> StatusCode {
     info!(
         "Server restart requested by user: {}",
         session
@@ -802,62 +802,10 @@ pub async fn system_restart(
             .username
     );
 
-    // Exit runs no destructors, so stop ffmpeg first. Not after the spawn:
-    // the successor binds the port once this process exits. Not the full
-    // `AppContext::shutdown`: its torrent HTTP listener stays bound, so a
-    // failed restart could not bring P2P back.
     state
         .ctx
-        .sessions
-        .stop_all()
-        .await;
-
-    // Returns only if the new process could not be spawned: this one keeps
-    // serving, so it must transcode again.
-    if let Err(e) = restart_server().await {
-        state
-            .ctx
-            .sessions
-            .reopen();
-        return Err(e);
-    }
-
-    Ok(Json(json!({
-        "Message": "Server restart initiated",
-        "RestartPending": true
-    })))
-}
-
-/// Actually restart the server process
-async fn restart_server() -> Result<()> {
-    info!("Initiating server restart...");
-
-    // Get the current executable path and arguments
-    let current_exe = std::env::current_exe()?;
-    let args: Vec<String> = std::env::args().collect();
-
-    info!("Restarting with: {:?} {:?}", current_exe, args);
-
-    // Spawn the new process
-    let mut command = std::process::Command::new(current_exe);
-    common::HideConsole::hide_console(&mut command);
-    command.args(&args[1..]); // Skip the first argument (program name)
-
-    // Set environment variables from current process
-    for (key, value) in std::env::vars() {
-        command.env(key, value);
-    }
-
-    // Start the new process
-    let child = command.spawn()?;
-
-    info!("New server process started with PID: {}", child.id());
-
-    // Give the new process a moment to start
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    // Exit the current process
-    std::process::exit(0);
+        .request_restart();
+    StatusCode::NO_CONTENT
 }
 
 /// Shutdown the server (Admin only)
@@ -865,7 +813,7 @@ async fn restart_server() -> Result<()> {
 pub async fn system_shutdown(
     State(state): State<AppState>,
     session: auth::AdminSession,
-) -> Result<impl IntoResponse> {
+) -> StatusCode {
     info!(
         "Server shutdown requested by user: {}",
         session
@@ -873,32 +821,11 @@ pub async fn system_shutdown(
             .username
     );
 
-    // Exit runs no destructors, so stop ffmpeg first.
     state
         .ctx
-        .shutdown()
-        .await;
-
-    shutdown_server().await?;
-
-    Ok(Json(json!({
-        "Message": "Server shutdown initiated",
-        "IsShuttingDown": true
-    })))
-}
-
-/// Actually shutdown the server process
-async fn shutdown_server() -> Result<()> {
-    info!("Initiating server shutdown...");
-
-    // Perform graceful shutdown
-    info!("Server is shutting down gracefully");
-
-    // Give a moment for cleanup
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    // Exit the process
-    std::process::exit(0);
+        .shutdown_requested
+        .cancel();
+    StatusCode::NO_CONTENT
 }
 
 #[get("/system/info")]
@@ -1040,6 +967,68 @@ mod test {
             .expect_failure()
             .await;
         response.assert_status(StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn system_restart_requests_graceful_exit() {
+        let (server, ctx, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        server
+            .post("/system/restart")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        assert!(
+            ctx.0
+                .shutdown_requested
+                .is_cancelled()
+        );
+    }
+
+    #[tokio::test]
+    async fn system_shutdown_requests_graceful_exit() {
+        let (server, ctx, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        server
+            .post("/system/shutdown")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+        assert!(
+            ctx.0
+                .shutdown_requested
+                .is_cancelled()
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                ctx.0
+                    .shutdown(),
+                ctx.0
+                    .shutdown()
+            );
+        })
+        .await
+        .unwrap();
+        assert!(
+            ctx.0
+                .task_shutdown
+                .lock()
+                .await
+                .is_none()
+        );
+        assert!(
+            ctx.0
+                .torrent
+                .read()
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]

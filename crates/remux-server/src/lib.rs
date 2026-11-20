@@ -7,7 +7,13 @@ use config;
 use remux_utils::Store;
 pub use result_ext::{IntoApiError, OptionExt, ResultExt};
 use serde::{Deserialize, Serialize};
-use std::{self, env, sync::Arc};
+use std::{
+    self, env,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 use tower::{Layer, util::MapRequestLayer};
 use tower_http::{
     cors::{Any, CorsLayer},
@@ -140,15 +146,204 @@ pub async fn init_app_with_ctx(config: Config) -> Result<(Router, AppContext)> {
 pub async fn serve(config: Config) -> Result<()> {
     let addr = std::net::SocketAddr::new(config.host, config.port);
     let (router, ctx) = init_app_from_filesystem(config).await?;
-    tokio::select! {
-        result = bind_and_serve(router, addr) => result,
-        Ok(()) = shutdown_signal() => {
-            // HLS ffmpeg writes to files and never notices remux exiting.
-            info!("shutting down");
-            ctx.shutdown()
+    serve_until_shutdown(router, addr, ctx, std::future::pending()).await
+}
+
+pub async fn serve_until_shutdown(
+    router: Router,
+    addr: std::net::SocketAddr,
+    ctx: AppContext,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => serve_listener(router, listener, &ctx, shutdown).await,
+        Err(error) => {
+            ctx.close()
                 .await;
-            Ok(())
+            Err(error.into())
         }
+    }
+}
+
+async fn serve_listener(
+    router: Router,
+    listener: tokio::net::TcpListener,
+    ctx: &AppContext,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> Result<()> {
+    info!(addr = %listener.local_addr()?, "starting webserver");
+    let app = MapRequestLayer::new(rewrite_request_uri).layer(router);
+    let handle = axum_server::Handle::new();
+    let server = axum_server::from_tcp(listener.into_std()?)?
+        .handle(handle.clone())
+        .serve(app.into_make_service());
+    tokio::pin!(server);
+    let result = tokio::select! {
+        biased;
+        _ = ctx.shutdown_requested.cancelled() => Ok::<(), anyhow::Error>(()),
+        _ = shutdown => Ok::<(), anyhow::Error>(()),
+        result = shutdown_signal() => result.map_err(anyhow::Error::from),
+        result = &mut server => {
+            ctx.close().await;
+            return result.map_err(anyhow::Error::from);
+        }
+    };
+    info!("shutting down");
+    ctx.shutdown_requested
+        .cancel();
+    let timeout = std::time::Duration::from_secs(
+        ctx.config
+            .shutdown_timeout_secs,
+    );
+    let deadline = tokio::time::Instant::now() + timeout;
+    handle.graceful_shutdown(Some(timeout));
+    let mut server_finished = false;
+    let cleanup = async {
+        let serve = async {
+            let result = (&mut server).await;
+            server_finished = true;
+            result
+        };
+        let (server_result, ()) = tokio::join!(serve, ctx.shutdown_until(deadline));
+        server_result?;
+        while handle.connection_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+        ctx.checkpoint_and_close_database()
+            .await;
+        Ok::<_, anyhow::Error>(())
+    };
+    match tokio::time::timeout_at(deadline, cleanup).await {
+        Ok(result) => result?,
+        Err(_) => {
+            handle.shutdown();
+            if !server_finished {
+                let _ = server.await;
+            }
+            while handle.connection_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+            ctx.abort_task_shutdown()
+                .await;
+            anyhow::bail!("server shutdown timed out");
+        }
+    }
+    info!("server shutdown complete");
+    result?;
+    if ctx
+        .restart_requested
+        .load(Ordering::Acquire)
+    {
+        restart_current_process()?;
+    }
+    Ok(())
+}
+
+fn restart_current_process() -> Result<()> {
+    let current_exe = std::env::current_exe()?;
+    let mut command = std::process::Command::new(&current_exe);
+    command.args(std::env::args_os().skip(1));
+    info!(executable = ?current_exe, "restarting server");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        return Err(command
+            .exec()
+            .into());
+    }
+
+    #[cfg(not(unix))]
+    {
+        common::HideConsole::hide_console(&mut command);
+        let child = command.spawn()?;
+        info!(pid = child.id(), "replacement server started");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod connection_shutdown_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn timeout_drops_stalled_request_and_closes_listener() {
+        let (_, guard) = integration_test::new_test_server()
+            .await
+            .unwrap();
+        let mut ctx = guard
+            .0
+            .clone();
+        ctx.config
+            .shutdown_timeout_secs = 1;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener
+            .local_addr()
+            .unwrap();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (dropped_tx, dropped_rx) = tokio::sync::oneshot::channel::<()>();
+        let state = Arc::new(tokio::sync::Mutex::new(Some((entered_tx, dropped_tx))));
+        let router = Router::new().route(
+            "/stalled",
+            get(move || {
+                let state = state.clone();
+                async move {
+                    let (entered, dropped) = state
+                        .lock()
+                        .await
+                        .take()
+                        .unwrap();
+                    let _dropped = dropped;
+                    let _ = entered.send(());
+                    std::future::pending::<&'static str>().await
+                }
+            }),
+        );
+        let (quit_tx, quit_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            serve_listener(router, listener, &ctx, async {
+                let _ = quit_rx.await;
+            })
+            .await
+        });
+        let request = tokio::spawn(async move {
+            reqwest::get(format!("http://{addr}/stalled")).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        quit_tx
+            .send(())
+            .unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("shutdown timed out")
+        );
+        assert!(
+            dropped_rx
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::net::TcpStream::connect(addr)
+                .await
+                .is_err()
+        );
+        assert!(
+            request
+                .await
+                .unwrap()
+                .is_err()
+        );
     }
 }
 
@@ -163,14 +358,6 @@ async fn shutdown_signal() -> std::io::Result<()> {
         result = tokio::signal::ctrl_c() => result,
         _ = terminate.recv() => Ok(()),
     }
-}
-
-pub async fn bind_and_serve(router: Router, addr: std::net::SocketAddr) -> Result<()> {
-    let app = MapRequestLayer::new(rewrite_request_uri).layer(router);
-    info!("starting webserver at {addr}");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app.into_make_service()).await?;
-    Ok(())
 }
 
 /// Loads `Config` from `env`, layered over the compiled-in defaults. Shared by
@@ -249,78 +436,135 @@ pub async fn init_app(
     remux_web: Option<RemuxWeb>,
     make_web_client: impl FnOnce(sqlx::SqlitePool) -> WebClientService,
 ) -> Result<(Router, AppContext)> {
+    init_app_with_shutdown(
+        config,
+        web_paths,
+        admin,
+        remux_web,
+        make_web_client,
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .await?
+    .ok_or_else(|| anyhow::anyhow!("startup cancelled"))
+}
+
+/// Initialize the application, cleaning up resources if shutdown is requested.
+pub async fn init_app_with_shutdown(
+    config: Config,
+    web_paths: Option<FilesystemPaths>,
+    admin: AdminService,
+    remux_web: Option<RemuxWeb>,
+    make_web_client: impl FnOnce(sqlx::SqlitePool) -> WebClientService,
+    shutdown: tokio_util::sync::CancellationToken,
+) -> Result<Option<(Router, AppContext)>> {
+    if shutdown.is_cancelled() {
+        return Ok(None);
+    }
     raise_open_file_limit();
     info!("starting remux {}", env!("CARGO_PKG_VERSION"));
     info!("config: {}", serde_json::to_string_pretty(&config).unwrap());
 
-    let conn = db::connect(
-        config
-            .database_url
-            .as_deref()
-            .expect("Config::resolve() must be called before init_app"),
-        config.slow_query_threshold_ms,
-    )
-    .await?;
+    let cleanup_timeout = std::time::Duration::from_secs(config.shutdown_timeout_secs);
+    let close_database = |pool: sqlx::SqlitePool| async move {
+        if tokio::time::timeout(cleanup_timeout, pool.close())
+            .await
+            .is_err()
+        {
+            warn!("database close timed out during startup cleanup");
+        }
+    };
+    let Some(conn) = shutdown
+        .run_until_cancelled(db::connect(
+            config
+                .database_url
+                .as_deref()
+                .expect("Config::resolve() must be called before init_app"),
+            config.slow_query_threshold_ms,
+        ))
+        .await
+        .transpose()?
+    else {
+        return Ok(None);
+    };
 
     info!("Running database migrations. Do not interrupt!");
-    db::migrate(&conn).await?;
+    if let Err(error) = db::migrate(&conn).await {
+        close_database(conn.clone()).await;
+        return Err(error);
+    }
     info!("migrations complete");
 
-    // Checkpoint the WAL before accepting any requests. At this point no
-    // other readers exist, so TRUNCATE is guaranteed to succeed and the WAL
-    // is cleared to zero — preventing large WALs left over from previous
-    // write-heavy tasks (metadata refresh, library scan) from slowing down
-    // the first queries after a restart.
-    sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
-        .execute(&conn)
-        .await
-        .ok();
-    crate::db::Settings::init_server_id(&conn).await?;
+    let prepare = async {
+        // Checkpoint the WAL before accepting any requests. At this point no
+        // other readers exist, so TRUNCATE is guaranteed to succeed and the WAL
+        // is cleared to zero — preventing large WALs left over from previous
+        // write-heavy tasks (metadata refresh, library scan) from slowing down
+        // the first queries after a restart.
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&conn)
+            .await
+            .ok();
+        crate::db::Settings::init_server_id(&conn).await?;
 
-    // Probe hardware and persist results at startup.
-    // vaapi_driver is always re-detected (regardless of auto_detect) because
-    // it is a runtime property of the host, not a user preference.
-    {
-        let mut enc_opts = db::Settings::get_encoding_config(&conn).await?;
-        if enc_opts
-            .auto_detect_hardware_acceleration
+        // Probe hardware and persist results at startup.
+        // vaapi_driver is always re-detected (regardless of auto_detect) because
+        // it is a runtime property of the host, not a user preference.
+        {
+            let mut enc_opts = db::Settings::get_encoding_config(&conn).await?;
+            if enc_opts
+                .auto_detect_hardware_acceleration
+                .unwrap_or(true)
+            {
+                let detected =
+                    crate::playback::engine::detect_hardware_acceleration().await;
+                enc_opts.hardware_acceleration_type = Some(detected);
+            }
+            let device = enc_opts
+                .vaapi_device
+                .as_deref()
+                .unwrap_or("/dev/dri/renderD128");
+            let driver = crate::playback::engine::detect_vaapi_driver(device).await;
+            let opencl =
+                crate::playback::engine::detect_opencl_tonemap(device, &driver).await;
+            tracing::info!(opencl_tonemap = opencl, "OpenCL tone mapping probed");
+            crate::playback::hw_accel::set_opencl_tonemap_available(opencl);
+            enc_opts.vaapi_driver = Some(driver);
+            db::Settings::set_encoding_config(&conn, &enc_opts).await?;
+        }
+
+        let saved_config = db::Settings::get_config(&conn).await?;
+
+        let addons = addons::AddonService::from_db(&conn, &config).await?;
+        let torrent_mgr = if saved_config
+            .p2p_enabled
             .unwrap_or(true)
         {
-            let detected =
-                crate::playback::engine::detect_hardware_acceleration().await;
-            enc_opts.hardware_acceleration_type = Some(detected);
+            let mgr = torrent::TorrentManager::from_config(&config).await?;
+            mgr.update_limits(
+                saved_config
+                    .p2p_upload_speed_kbps
+                    .unwrap_or(0),
+                saved_config
+                    .p2p_download_speed_kbps
+                    .unwrap_or(0),
+            );
+            Some(mgr)
+        } else {
+            None
+        };
+
+        Ok::<_, anyhow::Error>((saved_config, addons, torrent_mgr))
+    };
+    let prepared = shutdown
+        .run_until_cancelled(prepare)
+        .await
+        .transpose();
+    let (saved_config, addons, torrent_mgr) = match prepared {
+        Ok(Some(prepared)) => prepared,
+        result => {
+            close_database(conn.clone()).await;
+            return result.map(|_| None);
         }
-        let device = enc_opts
-            .vaapi_device
-            .as_deref()
-            .unwrap_or("/dev/dri/renderD128");
-        let driver = crate::playback::engine::detect_vaapi_driver(device).await;
-        let opencl =
-            crate::playback::engine::detect_opencl_tonemap(device, &driver).await;
-        tracing::info!(opencl_tonemap = opencl, "OpenCL tone mapping probed");
-        crate::playback::hw_accel::set_opencl_tonemap_available(opencl);
-        enc_opts.vaapi_driver = Some(driver);
-        db::Settings::set_encoding_config(&conn, &enc_opts).await?;
-    }
-
-    let saved_config = db::Settings::get_config(&conn).await?;
-
-    let p2p_enabled = saved_config
-        .p2p_enabled
-        .unwrap_or(true);
-    let torrent_mgr = if p2p_enabled {
-        let mgr = torrent::TorrentManager::from_config(&config).await?;
-        mgr.update_limits(
-            saved_config
-                .p2p_upload_speed_kbps
-                .unwrap_or(0),
-            saved_config
-                .p2p_download_speed_kbps
-                .unwrap_or(0),
-        );
-        Some(mgr)
-    } else {
-        None
     };
 
     let web_client = make_web_client(conn.clone());
@@ -330,7 +574,6 @@ pub async fn init_app(
         .is_some_and(|r| r.installed);
     let remux_web = remux_web.map(|r| r.service);
 
-    let addons = addons::AddonService::from_db(&conn, &config).await?;
     let transcode_sessions_dir = resolve_transcode_dir(&config.data_dir);
     let (ws_tx, _) = tokio::sync::broadcast::channel::<ws::WsEvent>(128);
     let mut signals = signals::Signals::default();
@@ -355,6 +598,11 @@ pub async fn init_app(
         addons,
         signals,
         started_at: Utc::now(),
+        shutdown_requested: tokio_util::sync::CancellationToken::new(),
+        restart_requested: Arc::new(AtomicBool::new(false)),
+        task_shutdown: Arc::new(tokio::sync::Mutex::new(None)),
+        task_shutdown_abort: Arc::new(tokio::sync::Mutex::new(None)),
+        shutdown_complete: Arc::new(tokio::sync::OnceCell::new()),
     };
     ctx.signals
         .register(services::media_tracker::MediaTrackerSubscriber { ctx: ctx.clone() });
@@ -365,64 +613,65 @@ pub async fn init_app(
             ctx.clone(),
         ));
 
-    // Sync intro items at startup (best-effort; errors are logged not fatal).
-    if let Err(e) = intro::sync_intros(&ctx).await {
-        warn!(err = ?e, "intro sync failed at startup");
-    }
+    let finish = async {
+        let prepare_tasks = async {
+            // Sync intro items at startup (best-effort; errors are logged not fatal).
+            if let Err(e) = intro::sync_intros(&ctx).await {
+                warn!(err = ?e, "intro sync failed at startup");
+            }
 
-    // Kill idle sessions after 15 minutes of no activity.
-    // Pings keep active sessions alive indefinitely.
-    ctx.sessions
-        .clone()
-        .spawn_cleanup_task(
-            std::time::Duration::from_secs(60),
-            std::time::Duration::from_secs(60 * 15),
-        );
+            db::StreamGroup::migrate_from_settings(&conn).await;
 
-    db::StreamGroup::migrate_from_settings(&conn).await;
-
-    let task_service = tasks::TaskService::new(ctx.clone()).await?;
-
-    task_service
-        .start()
-        .await?;
-    if !ctx
-        .config
-        .disable_startup_tasks
-    {
+            tasks::TaskService::new(ctx.clone()).await
+        };
+        let Some(task_service) = shutdown
+            .run_until_cancelled(prepare_tasks)
+            .await
+            .transpose()?
+        else {
+            return Ok(None);
+        };
         task_service
-            .run_startup_tasks()
+            .start()
             .await?;
-    }
+        let finish = async {
+            if !ctx
+                .config
+                .disable_startup_tasks
+            {
+                task_service
+                    .run_startup_tasks()
+                    .await?;
+            }
 
-    let state = AppState {
-        ctx: ctx.clone(),
-        tasks: task_service,
-    };
+            let state = AppState {
+                ctx: ctx.clone(),
+                tasks: task_service,
+            };
 
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any)
-        .expose_headers(Any);
+            let cors = CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any)
+                .expose_headers(Any);
 
-    let base = Router::new()
-        .route("/websocket", get(ws::ws_handler))
-        .route("/socket", get(ws::ws_handler))
-        .route("/", get(web_client::root_redirect))
-        .route("/serviceworker.js", get(web_client::root_serviceworker))
-        .merge(collect_routes());
+            let base = Router::new()
+                .route("/websocket", get(ws::ws_handler))
+                .route("/socket", get(ws::ws_handler))
+                .route("/", get(web_client::root_redirect))
+                .route("/serviceworker.js", get(web_client::root_serviceworker))
+                .merge(collect_routes());
 
-    let mut router = base
-        .nest_service("/admin", admin)
-        .nest_service("/web", web_client.clone())
-        .nest_service("/jellyfin", web_client);
-    if let Some(remux_web) = remux_web {
-        router = router.nest_service("/remux", remux_web);
-    }
-    let router = router.with_state(state);
+            let mut router = base
+                .nest_service("/admin", admin)
+                .nest_service("/web", web_client.clone())
+                .nest_service("/jellyfin", web_client);
+            if let Some(remux_web) = remux_web {
+                router = router.nest_service("/remux", remux_web);
+            }
+            let router = router.with_state(state);
 
-    let router = router
+            let router = router
         .layer(on_error(log_api_error))
         .layer(
             tower_http::trace::TraceLayer::new_for_http()
@@ -446,7 +695,56 @@ pub async fn init_app(
         )
         .layer(cors);
 
-    Ok((router, ctx))
+            Ok::<_, anyhow::Error>(router)
+        };
+        shutdown
+            .run_until_cancelled(finish)
+            .await
+            .transpose()
+    };
+    match finish.await {
+        Ok(Some(router)) => {
+            ctx.sessions
+                .clone()
+                .spawn_cleanup_task(
+                    std::time::Duration::from_secs(60),
+                    std::time::Duration::from_secs(60 * 15),
+                );
+            Ok(Some((router, ctx)))
+        }
+        result => {
+            ctx.shutdown()
+                .await;
+            close_database(conn.clone()).await;
+            result.map(|_| None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_startup_skips_database_and_services() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        shutdown.cancel();
+        let config = Config {
+            database_url: Some("not-a-database-url".into()),
+            ..Config::default()
+        };
+        let result = init_app_with_shutdown(
+            config,
+            None,
+            admin_from_filesystem(""),
+            None,
+            |_| panic!("web client must not be initialized"),
+            shutdown,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_none());
+    }
 }
 
 #[derive(Clone)]
@@ -466,6 +764,13 @@ pub struct AppContext {
     pub signals: signals::Signals,
     /// When this server process started.
     pub started_at: chrono::DateTime<chrono::Utc>,
+    pub shutdown_requested: tokio_util::sync::CancellationToken,
+    restart_requested: Arc<AtomicBool>,
+    pub(crate) task_shutdown:
+        Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    pub(crate) task_shutdown_abort:
+        Arc<tokio::sync::Mutex<Option<tokio::task::AbortHandle>>>,
+    shutdown_complete: Arc<tokio::sync::OnceCell<()>>,
 }
 
 impl AppContext {
@@ -473,43 +778,155 @@ impl AppContext {
     /// would outlive remux) and refuse new transcodes, then shut down
     /// background services (torrent DHT, etc.) to release sockets immediately.
     /// Call this when the server is stopping.
-    pub async fn shutdown(&self) {
-        self.sessions
-            .stop_all()
-            .await;
-        let old = self
-            .torrent
-            .write()
+    async fn close(&self) {
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(
+                self.config
+                    .shutdown_timeout_secs,
+            );
+        let cleanup = async {
+            self.shutdown_until(deadline)
+                .await;
+            self.checkpoint_and_close_database()
+                .await;
+        };
+        if tokio::time::timeout_at(deadline, cleanup)
             .await
-            .take();
-        if let Some(mgr) = old {
-            mgr.shutdown()
+            .is_err()
+        {
+            self.abort_task_shutdown()
+                .await;
+            error!("server cleanup timed out");
+        }
+    }
+
+    pub fn request_restart(&self) {
+        self.restart_requested
+            .store(true, Ordering::Release);
+        self.shutdown_requested
+            .cancel();
+    }
+
+    async fn checkpoint_and_close_database(&self) {
+        if let Err(error) = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&self.db)
+            .await
+        {
+            warn!(%error, "final WAL checkpoint failed");
+        }
+        self.db
+            .close()
+            .await;
+    }
+
+    pub async fn shutdown(&self) {
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(
+                self.config
+                    .shutdown_timeout_secs,
+            );
+        self.shutdown_until(deadline)
+            .await;
+    }
+
+    async fn shutdown_until(&self, deadline: tokio::time::Instant) {
+        self.shutdown_requested
+            .cancel();
+        if tokio::time::timeout_at(
+            deadline,
+            self.shutdown_complete
+                .get_or_init(|| self.shutdown_services()),
+        )
+        .await
+        .is_err()
+        {
+            error!("service shutdown timed out");
+            self.abort_task_shutdown()
                 .await;
         }
     }
 
-    pub async fn set_p2p_enabled(&self, enabled: bool) -> anyhow::Result<()> {
-        let current = self
-            .torrent
-            .read()
+    async fn abort_task_shutdown(&self) {
+        if let Some(abort) = self
+            .task_shutdown_abort
+            .lock()
             .await
-            .clone();
+            .as_ref()
+        {
+            abort.abort();
+        }
+        let mut task = self
+            .task_shutdown
+            .lock()
+            .await;
+        if let Some(handle) = task.as_mut() {
+            handle.abort();
+            let _ = handle.await;
+        }
+        task.take();
+    }
+
+    async fn shutdown_services(&self) {
+        let tasks = async {
+            let mut task_shutdown = self
+                .task_shutdown
+                .lock()
+                .await;
+            if let Some(handle) = task_shutdown.as_mut() {
+                if let Err(error) = handle.await {
+                    error!(%error, "task shutdown failed");
+                }
+            }
+            task_shutdown.take();
+        };
+        let torrent = async {
+            let old = self
+                .torrent
+                .write()
+                .await
+                .take();
+            if let Some(mgr) = old {
+                mgr.shutdown()
+                    .await;
+            }
+        };
+        tokio::join!(
+            self.sessions
+                .stop_all(),
+            tasks,
+            torrent
+        );
+    }
+
+    pub async fn set_p2p_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+        let mut current = self
+            .torrent
+            .write()
+            .await;
+        anyhow::ensure!(
+            !self
+                .shutdown_requested
+                .is_cancelled(),
+            "server is shutting down"
+        );
         match (enabled, current.is_some()) {
             (true, false) => {
-                let mgr =
-                    Arc::new(torrent::TorrentManager::from_config(&self.config).await?);
-                *self
-                    .torrent
-                    .write()
-                    .await = Some(mgr);
+                let mgr = tokio::select! {
+                    biased;
+                    _ = self.shutdown_requested.cancelled() => anyhow::bail!("server is shutting down"),
+                    result = torrent::TorrentManager::from_config(&self.config) => Arc::new(result?),
+                };
+                if self
+                    .shutdown_requested
+                    .is_cancelled()
+                {
+                    drop(mgr);
+                    anyhow::bail!("server is shutting down");
+                }
+                *current = Some(mgr);
             }
             (false, true) => {
-                let old = self
-                    .torrent
-                    .write()
-                    .await
-                    .take();
-                if let Some(mgr) = old {
+                if let Some(mgr) = current.take() {
                     mgr.shutdown()
                         .await;
                 }
@@ -560,6 +977,10 @@ fn default_host() -> std::net::IpAddr {
     std::net::Ipv4Addr::UNSPECIFIED.into()
 }
 
+fn default_shutdown_timeout_secs() -> u64 {
+    30
+}
+
 fn default_port() -> u16 {
     3000
 }
@@ -595,6 +1016,8 @@ pub struct Config {
     pub host: std::net::IpAddr,
     #[serde(default = "default_port")]
     pub port: u16,
+    #[serde(default = "default_shutdown_timeout_secs")]
+    pub shutdown_timeout_secs: u64,
     /// Explicit port for the internal torrent HTTP server.
     /// When absent the OS picks a free ephemeral port.
     #[serde(default = "default_torrent_http_port_opt")]
@@ -803,6 +1226,7 @@ impl Default for Config {
             torrent_data_dir: None,
             host: default_host(),
             port: default_port(),
+            shutdown_timeout_secs: default_shutdown_timeout_secs(),
             torrent_http_port: default_torrent_http_port_opt(),
             slow_query_threshold_ms: default_slow_query_threshold_ms(),
             disable_dht: false,
@@ -1282,6 +1706,431 @@ mod config_log_tests {
         assert!(
             logged.contains(r#""ytdlp_extra_args":"<redacted>""#),
             "{logged}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn shutdown_drains_in_flight_requests() {
+        let (_app, guard) = integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = guard
+            .0
+            .clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener
+            .local_addr()
+            .unwrap();
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let channels = Arc::new(tokio::sync::Mutex::new(Some((entered_tx, finish_rx))));
+        let router = Router::new().route(
+            "/slow",
+            get(move || {
+                let channels = channels.clone();
+                async move {
+                    let (entered_tx, finish_rx) = channels
+                        .lock()
+                        .await
+                        .take()
+                        .unwrap();
+                    let _ = entered_tx.send(());
+                    let _ = finish_rx.await;
+                    "finished"
+                }
+            }),
+        );
+        let (quit_tx, quit_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            serve_listener(router, listener, &ctx, async {
+                let _ = quit_rx.await;
+            })
+            .await
+        });
+        let request = tokio::spawn(async move {
+            reqwest::get(format!("http://{addr}/slow"))
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        quit_tx
+            .send(())
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            guard
+                .0
+                .shutdown_requested
+                .cancelled(),
+        )
+        .await
+        .unwrap();
+        assert!(!server.is_finished());
+        finish_tx
+            .send(())
+            .unwrap();
+        assert_eq!(
+            request
+                .await
+                .unwrap(),
+            "finished"
+        );
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shutdown_refuses_p2p_changes() {
+        let (_app, guard) = integration_test::new_test_server()
+            .await
+            .unwrap();
+        guard
+            .0
+            .shutdown()
+            .await;
+        assert!(
+            guard
+                .0
+                .set_p2p_enabled(true)
+                .await
+                .is_err()
+        );
+        assert!(
+            guard
+                .0
+                .torrent
+                .read()
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_bounds_blocked_task_cleanup() {
+        let (_app, mut guard) = integration_test::new_test_server()
+            .await
+            .unwrap();
+        guard
+            .0
+            .config
+            .shutdown_timeout_secs = 1;
+        let watcher = guard
+            .0
+            .task_shutdown
+            .lock()
+            .await
+            .take()
+            .unwrap();
+        watcher.abort();
+        let blocked = tokio::spawn(std::future::pending::<()>());
+        let abort = blocked.abort_handle();
+        *guard
+            .0
+            .task_shutdown_abort
+            .lock()
+            .await = Some(abort.clone());
+        *guard
+            .0
+            .task_shutdown
+            .lock()
+            .await = Some(blocked);
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            guard
+                .0
+                .shutdown(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            guard
+                .0
+                .shutdown_complete
+                .get()
+                .is_none()
+        );
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            guard
+                .0
+                .shutdown(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            guard
+                .0
+                .shutdown_complete
+                .get()
+                .is_some()
+        );
+        assert!(abort.is_finished());
+        assert!(
+            guard
+                .0
+                .torrent
+                .read()
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_without_connections_bounds_blocked_task_cleanup() {
+        let (_app, mut guard) = integration_test::new_test_server()
+            .await
+            .unwrap();
+        guard
+            .0
+            .config
+            .shutdown_timeout_secs = 1;
+        let ctx = &guard.0;
+        let watcher = ctx
+            .task_shutdown
+            .lock()
+            .await
+            .take()
+            .unwrap();
+        watcher.abort();
+        let _ = watcher.await;
+        let blocked = tokio::spawn(std::future::pending::<()>());
+        let abort = blocked.abort_handle();
+        *ctx.task_shutdown_abort
+            .lock()
+            .await = Some(abort.clone());
+        *ctx.task_shutdown
+            .lock()
+            .await = Some(blocked);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            serve_listener(Router::new(), listener, ctx, async {}),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "server shutdown timed out");
+        assert!(abort.is_finished());
+        assert!(
+            ctx.task_shutdown
+                .lock()
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_shutdown_aborts_task_at_earlier_deadline() {
+        let (_app, guard) = integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let watcher = ctx
+            .task_shutdown
+            .lock()
+            .await
+            .take()
+            .unwrap();
+        watcher.abort();
+        let _ = watcher.await;
+
+        let blocked = tokio::spawn(std::future::pending::<()>());
+        let abort = blocked.abort_handle();
+        *ctx.task_shutdown_abort
+            .lock()
+            .await = Some(abort.clone());
+        *ctx.task_shutdown
+            .lock()
+            .await = Some(blocked);
+
+        let first_ctx = ctx.clone();
+        let first = tokio::spawn(async move {
+            first_ctx
+                .shutdown_until(tokio::time::Instant::now() + Duration::from_secs(60))
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while ctx
+                .task_shutdown
+                .try_lock()
+                .is_ok()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            ctx.shutdown_until(tokio::time::Instant::now() + Duration::from_millis(50))
+                .await;
+            first
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(abort.is_finished());
+        assert!(
+            ctx.task_shutdown
+                .lock()
+                .await
+                .is_none()
+        );
+        assert!(
+            ctx.shutdown_complete
+                .get()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_failure_cleans_up_services() {
+        let (_app, guard) = integration_test::new_test_server()
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let result = serve_until_shutdown(
+            Router::new(),
+            listener
+                .local_addr()
+                .unwrap(),
+            guard
+                .0
+                .clone(),
+            std::future::pending(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            guard
+                .0
+                .db
+                .is_closed()
+        );
+        assert!(
+            guard
+                .0
+                .torrent
+                .read()
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn bind_failure_bounds_cleanup_with_held_pool_connection() {
+        let (_app, mut guard) = integration_test::new_test_server()
+            .await
+            .unwrap();
+        guard
+            .0
+            .config
+            .shutdown_timeout_secs = 1;
+        let connection = guard
+            .0
+            .db
+            .acquire()
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            serve_until_shutdown(
+                Router::new(),
+                listener
+                    .local_addr()
+                    .unwrap(),
+                guard
+                    .0
+                    .clone(),
+                std::future::pending(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .kind(),
+            std::io::ErrorKind::AddrInUse
+        );
+        assert!(
+            guard
+                .0
+                .db
+                .is_closed()
+        );
+        drop(connection);
+    }
+
+    #[tokio::test]
+    async fn shutdown_requested_before_serving_is_retained() {
+        let (_app, guard) = integration_test::new_test_server()
+            .await
+            .unwrap();
+        let db = guard
+            .0
+            .db
+            .clone();
+        let (quit_tx, quit_rx) = oneshot::channel();
+        quit_tx
+            .send(())
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            serve_until_shutdown(
+                Router::new(),
+                "127.0.0.1:0"
+                    .parse()
+                    .unwrap(),
+                guard
+                    .0
+                    .clone(),
+                async {
+                    let _ = quit_rx.await;
+                },
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(db.is_closed());
+        assert!(
+            guard
+                .0
+                .shutdown_requested
+                .is_cancelled()
         );
     }
 }
