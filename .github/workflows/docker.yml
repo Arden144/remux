@@ -1,0 +1,19 @@
+name: Docker
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build and publish
+    uses: ./.github/workflows/build.yml
+    with:
+      version: nightly
+      docker_tags: -t ghcr.io/arden144/remux:nightly
+      registry_image: ghcr.io/arden144/remux
+      desktop: false
+    secrets: inherit
